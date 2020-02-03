@@ -1,3 +1,5 @@
+#include <exception>
+#include <iostream>
 #include <opencv2/opencv.hpp>
 #include "TrtNet.h"
 #include "argsParser.h"
@@ -24,7 +26,7 @@ vector<float> prepareImage(cv::Mat& img)
     auto scaleSize = cv::Size(img.cols * scale,img.rows * scale);
 
     cv::Mat rgb ;
-    cv::cvtColor(img, rgb, CV_BGR2RGB);
+    cv::cvtColor(img, rgb, COLOR_BGR2RGB);
     cv::Mat resized;
     cv::resize(rgb, resized,scaleSize,0,0,INTER_CUBIC);
 
@@ -190,6 +192,7 @@ int main( int argc, char* argv[] )
 
     //input
     parser::ADD_ARG_STRING("input",Desc("input image file"),DefaultValue(INPUT_IMAGE),ValueDesc("file"));
+    parser::ADD_ARG_INT("skiptoframe",Desc("frame pos to start from"),DefaultValue("1"));
     parser::ADD_ARG_STRING("evallist",Desc("eval gt list"),DefaultValue(EVAL_LIST),ValueDesc("file"));
 
     if(argc < 2){
@@ -272,6 +275,8 @@ int main( int argc, char* argv[] )
     list<string> fileNames;
     list<vector<Bbox>> groundTruth;
 
+    string inputFileName = parser::getStringValue("input");
+    
     if(listFile.length() > 0)
     {
         std::cout << "loading from eval list " << listFile << std::endl; 
@@ -279,7 +284,6 @@ int main( int argc, char* argv[] )
     }
     else
     {
-        string inputFileName = parser::getStringValue("input");
         fileNames.push_back(inputFileName);
     }
 
@@ -288,38 +292,33 @@ int main( int argc, char* argv[] )
     int c = parser::getIntValue("C");
     int h = parser::getIntValue("H");
     int w = parser::getIntValue("W");
-    int batchCount = 0;
+    int batchCount = 1;
     vector<float> inputData;
     inputData.reserve(h*w*c*batchSize);
     vector<cv::Mat> inputImgs;
 
     auto iter = fileNames.begin();
-    for (unsigned int i = 0;i < fileNames.size(); ++i ,++iter)
-    {
-        const string& filename  = *iter;
-
-        std::cout << "process: " << filename << std::endl;
-
-        cv::Mat img = cv::imread(filename);
-	    if (img.empty())
-		{
-			std::cerr << "fail to load image:" << filename << std::endl;
-			continue;
+    cv::VideoCapture cap;
+    cap.open(inputFileName);
+    assert(cap.isOpened());
+    // skip to frame
+    int frame_num = parser::getIntValue("skiptoframe");
+    cap.set(cv::CAP_PROP_POS_FRAMES, frame_num);
+    while (1) {
+        cv::Mat img;
+        cap.read(img);
+	    if (img.empty()) {
+		    break;
         }
+        frame_num++;
+        cout << "Frame " << frame_num << endl;
         vector<float> curInput = prepareImage(img);
-        inputImgs.emplace_back(img);
-
-        inputData.insert(inputData.end(), curInput.begin(), curInput.end());
-        batchCount++;
-
-        if(batchCount < batchSize && i + 1 <  fileNames.size())
-            continue;
-
-        net->doInference(inputData.data(), outputData.get(),batchCount);
+        
+        net->doInference(curInput.data(), outputData.get());
 
         //Get Output    
         auto output = outputData.get();
-        auto outputSize = net->getOutputSize()/ sizeof(float) / batchCount;
+        auto outputSize = net->getOutputSize()/sizeof(float)/batchCount;
         for(int i = 0;i< batchCount ; ++i)
         {    
             //first detect count
@@ -329,42 +328,28 @@ int main( int argc, char* argv[] )
             result.resize(detCount);
             memcpy(result.data(), &output[1], detCount*sizeof(Detection));
 
-            auto boxes = postProcessImg(inputImgs[i],result,classNum);
+            auto boxes = postProcessImg(img,result,classNum);
             outputs.emplace_back(boxes);
-
             output += outputSize;
+
+            for(const auto& item : boxes) {
+                const cv::Scalar color_green = cv::Scalar(0,255,0); 
+                cv::rectangle(img,cv::Point(item.left,item.top),
+                    cv::Point(item.right,item.bot),color_green,3,8,0);
+                string label = "Person ("+to_string((int)(item.score*100))+" %)";
+                double font_scale = 0.75;
+                int font_thickness = 2;
+                cv::putText(img, label, cv::Point(item.left,item.top-15), 
+                    cv::FONT_HERSHEY_SIMPLEX, font_scale, color_green, font_thickness);
+                cout << "class=" << item.classId << " prob=" << item.score*100 << endl;
+            }
+            cv::imwrite("frame_"+to_string(frame_num)+".jpg", img);
         }
         inputImgs.clear();
         inputData.clear();
-
-        batchCount = 0;
+        //net->printTime();
     }
     
-    
-    net->printTime();        
-
-    if(groundTruth.size() > 0)
-    {
-        //eval map
-        evalMAPResult(outputs,groundTruth,classNum,0.5f);
-        evalMAPResult(outputs,groundTruth,classNum,0.75f);
-    }
-
-    if(fileNames.size() == 1)
-    {
-        //draw on image
-        cv::Mat img = cv::imread(*fileNames.begin());
-        auto bbox = *outputs.begin();
-        for(const auto& item : bbox)
-        {
-            cv::rectangle(img,cv::Point(item.left,item.top),cv::Point(item.right,item.bot),cv::Scalar(0,0,255),3,8,0);
-            cout << "class=" << item.classId << " prob=" << item.score*100 << endl;
-            cout << "left=" << item.left << " right=" << item.right << " top=" << item.top << " bot=" << item.bot << endl;
-        }
-        cv::imwrite("result.jpg",img);
-        cv::imshow("result",img);
-        cv::waitKey(0);
-    }
-
+    std::cout << "Done, exiting.";
     return 0;
 }
